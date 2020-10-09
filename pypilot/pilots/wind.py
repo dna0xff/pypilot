@@ -25,10 +25,10 @@ class WindPilot(AutopilotPilot):
     self.gps_wind_offset = HeadingOffset()
     self.true_wind_wind_offset = HeadingOffset()
 
-    self.heading = self.Register(SensorValue, 'heading', directional=True)
-    self.heading_error = self.Register(SensorValue, 'heading_error')
-    self.heading_error_int = self.Register(SensorValue, 'heading_error_int')
-    self.heading_error_int_time = time.time()
+    self.heading = self.register(SensorValue, 'heading', directional=True)
+    self.heading_error = self.register(SensorValue, 'heading_error')
+    self.heading_error_int = self.register(SensorValue, 'heading_error_int')
+    self.heading_error_int_time = time.monotonic()
 
     # create simple pid filter
     self.gains = {}
@@ -85,7 +85,7 @@ class WindPilot(AutopilotPilot):
       # for true wind, need gps
       if ap.sensors.gps.source.value == 'none':
         ap.mode_lost('wind')
-      true_wind = resolv(ap.true_wind_wind_offset.value + wind, 180)
+      true_wind = resolv(ap.true_wind_wind_offset.value + wind)
       ap.heading.set(true_wind)
 
     if mode == 'compass':

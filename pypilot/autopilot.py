@@ -9,22 +9,20 @@
 
 # autopilot base handles reading from the imu (boatimu)
 
-from __future__ import print_function
-import sys, os
-import math
+import sys, os, math
 
 pypilot_dir = os.getenv('HOME') + '/.pypilot/'
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-import os.path
-from server import *
-from pipeserver import pypilotPipeServer
+from server import pypilotServer
+from client import pypilotClient
 from values import *
 from boatimu import *
 from resolv import *
 import tacking, servo
 from version import strversion
 from sensors import Sensors
+import pilots
 
 def minmax(value, r):
     return min(max(value, -r), r)
@@ -36,363 +34,351 @@ def compute_true_wind(gps_speed, wind_speed, wind_direction):
     #print 'truewind', truewind
     return truewind
 
-class Filter(object):
-    def __init__(self,filtered, lowpass):
-        self.filtered = filtered
-        self.lowpass = lowpass
-        self.lastfilter_time = time.time()
-        
-    def update(self, value):
-        t = time.time()
-        timediff = t - self.lastfilter_time
-        self.lastfilter_time = t
-        #        rate = self.lowpass.value * timediff
-        rate = self.lowpass.value
-        if rate > 1:
-            rate = 1
-
-        filtered = self.filtered.value
-        self.filtered.set(filtered + rate * (value-filtered))
-        
-class FilterHeading(object):
-  def __init__(self, *args, **keywords):
-    super(FilterHeading, self).__init__(*args, **keywords)
-    self.variables = []
-
-    def update(self, value):
-        # detect passing the wrong way around
-        if value - self.value > 180:
-            self.value = self.value + 360
-        elif self.value - value > 180:
-            self.value = self.value - 360
-        super(FilterHeading, self).update(value)
-
 class ModeProperty(EnumProperty):
-      def __init__(self, name):
+    def __init__(self, name):
         self.ap = False
         super(ModeProperty, self).__init__(name, 'compass', ['compass', 'gps', 'wind', 'true wind'], persistent=True)
 
-      def set(self, value):
+    def set(self, value):
         # update the preferred mode when the mode changes from user
         if self.ap:
             self.ap.preferred_mode.update(value)
         self.set_internal(value)
 
-      def set_internal(self, value):
+    def set_internal(self, value):
         super(ModeProperty, self).set(value)
 
 class HeadingOffset(object):
-  def __init__(self):
-    self.value = 0
+    def __init__(self):
+        self.value = 0
 
-  def update(self, offset, d):
-      offset = resolv(offset, self.value)
-      self.value = resolv(d*offset + (1-d)*self.value)
+    def update(self, offset, d):
+        offset = resolv(offset, self.value)
+        self.value = resolv(d*offset + (1-d)*self.value)
+
+class HeadingProperty(RangeProperty):
+    def __init__(self, name, mode):
+        self.mode = mode
+        super(HeadingProperty, self).__init__(name, 0, -180, 360)
+
+    # +-180 for wind modes 0-360 for compass and gps modes
+    def set(self, value):
+        value = resolv(value, 0 if 'wind' in self.mode.value else 180)
+        super(HeadingProperty, self).set(value)
   
-import pilots
 class Autopilot(object):
-  def __init__(self):
-    super(Autopilot, self).__init__()
+    def __init__(self):
+        super(Autopilot, self).__init__()    
+        self.watchdog_device = False
 
-    # setup all processes to exit on any signal
-    self.childpids = []
-    def cleanup(signal_number, frame=None):
-        print('got signal', signal_number, 'cleaning up')
-        while self.childpids:
-            pid = self.childpids.pop()
-            #print('kill child', pid)
-            os.kill(pid, signal.SIGTERM) # get backtrace
-        sys.stdout.flush()
-        if signal_number != 'atexit':
-            raise KeyboardInterrupt # to get backtrace on all processes
+        self.server = pypilotServer()
+        self.client = pypilotClient(self.server)
+        self.boatimu = BoatIMU(self.client)
+        self.sensors = Sensors(self.client)
+        self.servo = servo.Servo(self.client, self.sensors)
+        self.version = self.register(Value, 'version', 'pypilot' + ' ' + strversion)
+        self.timestamp = self.client.register(SensorValue('timestamp', 0))
+        self.starttime = time.monotonic()
+        self.mode = self.register(ModeProperty, 'mode')
 
-    # unfortunately we occasionally get this signal,
-    # some sort of timing issue where python doesn't realize the pipe
-    # is broken yet, so doesn't raise an exception
-    def printpipewarning(signal_number, frame):
-        print('got SIGPIPE, ignoring')
-
-    import signal
-    for s in range(1, 16):
-        if s == 13:
-            signal.signal(s, printpipewarning)
-        elif s != 9:
-            signal.signal(s, cleanup)
-
-#    self.server = pypilotServer()
-    self.server = pypilotPipeServer()
-    self.boatimu = BoatIMU(self.server)
-    self.sensors = Sensors(self.server)
-    self.servo = servo.Servo(self.server, self.sensors)
-
-    self.version = self.Register(Value, 'version', 'pypilot' + ' ' + strversion)
-    self.heading_command = self.Register(HeadingProperty, 'heading_command', 0)
-    self.enabled = self.Register(BooleanProperty, 'enabled', False)
-    self.lastenabled = False
-
-    self.preferred_mode = self.Register(Value, 'preferred_mode', 'compass')
-    self.lastmode = False    
-    self.mode = self.Register(ModeProperty, 'mode')
-    self.mode.ap = self
-
-    self.last_heading = False
-    self.last_heading_off = self.boatimu.heading_off.value
-
-    self.pilots = []
-    for pilot_type in pilots.default:
-        try:
-            self.pilots.append(pilot_type(self))
-        except Exception as e:
-            print('failed to load pilot', pilot_type, e)
-
-    pilot_names = list(map(lambda pilot : pilot.name, self.pilots))
-    print('Loaded Pilots:', pilot_names)
-    self.pilot = self.Register(EnumProperty, 'pilot', 'basic', pilot_names, persistent=True)
-
-    self.heading = self.Register(SensorValue, 'heading', directional=True)
-    self.heading_error = self.Register(SensorValue, 'heading_error')
-    self.heading_error_int = self.Register(SensorValue, 'heading_error_int')
-    self.heading_error_int_time = time.time()
-
-    self.tack = tacking.Tack(self)
-
-    self.gps_compass_offset = HeadingOffset()
-    self.gps_speed = 0
-
-    self.wind_compass_offset = HeadingOffset()
-    self.true_wind_compass_offset = HeadingOffset()
-    
-    self.wind_direction = self.Register(SensorValue, 'wind_direction', directional=True)
-    self.wind_speed = 0
-
-    self.runtime = self.Register(TimeValue, 'runtime') #, persistent=True)
-
-    device = '/dev/watchdog0'
-    self.watchdog_device = False
-    try:
-        self.watchdog_device = open(device, 'w')
-    except:
-        print('warning: failed to open special file', device, 'for writing')
-        print('         cannot stroke the watchdog')
-
-    if os.system('sudo chrt -pf 99 %d 2>&1 > /dev/null' % os.getpid()):
-        print('warning, failed to make autopilot process realtime')
-
-    self.times = 4*[0]
-
-    self.childpids = [self.boatimu.imu_process.pid, self.boatimu.auto_cal.process.pid,
-                      self.sensors.nmea.process.pid, self.sensors.gps.process.pid]
-    try:
-        self.childpids += [self.server.process.pid]
-    except:
-        print('warning no server process')
+        self.preferred_mode = self.register(Value, 'preferred_mode', 'compass')
+        self.lastmode = False    
+        self.mode.ap = self
         
-    signal.signal(signal.SIGCHLD, cleanup)
-    import atexit
-    atexit.register(lambda : cleanup('atexit'))
+        self.heading_command = self.register(HeadingProperty, 'heading_command', self.mode)
+        self.enabled = self.register(BooleanProperty, 'enabled', False)
+        self.lastenabled = False
+        
+        self.last_heading = False
+        self.last_heading_off = self.boatimu.heading_off.value
+        
+        self.pilots = {}
+        for pilot_type in pilots.default:
+            try:
+                pilot = pilot_type(self)
+                self.pilots[pilot.name] = pilot
+            except Exception as e:
+                print('failed to load pilot', pilot_type, e)
+
+        pilot_names = list(self.pilots)
+        print('Loaded Pilots:', pilot_names)
+        self.pilot = self.register(EnumProperty, 'pilot', 'basic', pilot_names, persistent=True)
+
+        self.heading = self.register(SensorValue, 'heading', directional=True)
+        self.heading_error = self.register(SensorValue, 'heading_error')
+        self.heading_error_int = self.register(SensorValue, 'heading_error_int')
+        self.heading_error_int_time = time.monotonic()
+
+        self.tack = tacking.Tack(self)
+
+        self.gps_compass_offset = HeadingOffset()
+        self.gps_speed = 0
+
+        self.wind_compass_offset = HeadingOffset()
+        self.true_wind_compass_offset = HeadingOffset()
+
+        self.wind_direction = self.register(SensorValue, 'wind_direction', directional=True)
+        self.wind_speed = 0
+
+        self.runtime = self.register(TimeValue, 'runtime') #, persistent=True)
+        self.timings = self.register(SensorValue, 'timings', False)
+
+        device = '/dev/watchdog0'
+        try:
+            self.watchdog_device = open(device, 'w')
+        except:
+            print('warning: failed to open special file', device, 'for writing')
+            print('         cannot stroke the watchdog')
+
+        self.server.poll() # setup process before we switch main process to realtime
+        if os.system('sudo chrt -pf 1 %d 2>&1 > /dev/null' % os.getpid()):
+            print('warning, failed to make autopilot process realtime')
     
-    self.lasttime = time.time()
+        self.lasttime = time.monotonic()
 
-    # read initial value from imu as this takes time
-#    while not self.boatimu.IMURead():
-#        time.sleep(.1)
+        # setup all processes to exit on any signal
+        self.childprocesses = [self.boatimu.imu, self.boatimu.auto_cal,
+                               self.sensors.nmea, self.sensors.gpsd,
+                               self.sensors.signalk, self.server]
+        def cleanup(signal_number, frame=None):
+            #print('got signal', signal_number, 'cleaning up')
+            if signal_number == signal.SIGCHLD:
+                pid = os.waitpid(-1, os.WNOHANG)
+                #print('sigchld waitpid', pid)
 
-  def __del__(self):
-      print('closing autopilot')
-      self.server.__del__()
+            if signal_number != 'atexit': # don't get this signal again
+                signal.signal(signal_number, signal.SIG_IGN)
 
-      if self.watchdog_device:
-          print('close watchdog')
-          self.watchdog_device.write('V')
-          self.watchdog_device.close()
+            while self.childprocesses:
+                process = self.childprocesses.pop().process
+                if process:
+                    pid = process.pid
+                    #print('kill', pid, process)
+                    try:
+                        os.kill(pid, signal.SIGTERM) # get backtrace
+                    except Exception as e:
+                        pass
+                        #print('kill failed', e)
+            sys.stdout.flush()
+            if signal_number != 'atexit':
+                raise KeyboardInterrupt # to get backtrace on all processes
 
-  def Register(self, _type, name, *args, **kwargs):
-    return self.server.Register(_type(*(['ap.' + name] + list(args)), **kwargs))
+        # unfortunately we occasionally get this signal,
+        # some sort of timing issue where python doesn't realize the pipe
+        # is broken yet, so doesn't raise an exception
+        def printpipewarning(signal_number, frame):
+            print('got SIGPIPE, ignoring')
 
-  def run(self):
-      while True:
-          self.iteration()
+        import signal
+        for s in range(1, 16):
+            if s == 13:
+                signal.signal(s, printpipewarning)
+            elif s != 9:
+                signal.signal(s, cleanup)
 
-  def adjust_mode(self, pilot):
-      # if the mode must change
-      newmode = pilot.best_mode(self.preferred_mode.value)
-      if self.mode.value != newmode:
-          self.mode.set_internal(newmode)
-
-  def compute_offsets(self):
-      # compute difference between compass to gps and compass to wind
-      compass = self.boatimu.SensorValues['heading_lowpass'].value
-      if self.sensors.gps.source.value != 'none':
-          d = .002
-          gps_speed = self.sensors.gps.speed.value
-          self.gps_speed = (1-d)*self.gps_speed + d*gps_speed
-          if gps_speed > 1: # don't update gps offset below 1 knot
-              gps_track  = self.sensors.gps.track.value
-              # weight gps compass offset higher with more gps speed
-              d = .005*math.log(self.gps_speed + 1)
-              self.gps_compass_offset.update(gps_track - compass, d)
-
-      if self.sensors.wind.source.value != 'none':
-          d = .005
-          wind_speed = self.sensors.wind.speed.value
-          self.wind_speed = (1-d)*self.wind_speed + d*wind_speed
-          # weight wind direction more with higher wind speed
-          d = .05*math.log(wind_speed/5.0 + 1.2)
-          wind_direction = resolv(self.sensors.wind.direction.value, self.wind_direction.value)
-          wind_direction = (1-d)*self.wind_direction.value + d*wind_direction
-          self.wind_direction.set(resolv(wind_direction, 180))
-          self.wind_compass_offset.update(wind_direction + compass, d)
-
-          if self.sensors.gps.source.value != 'none':
-            true_wind = compute_true_wind(self.gps_speed, self.wind_speed,
-                                          self.wind_direction.value)
-            offset = resolv(true_wind + compass, self.true_wind_compass_offset.value)
-            d = .05
-            self.true_wind_compass_offset.update(offset, d)
+        signal.signal(signal.SIGCHLD, cleanup)
+        import atexit
+        atexit.register(lambda : cleanup('atexit'))
     
-  def fix_compass_calibration_change(self, data, t0):
-      headingrate = self.boatimu.SensorValues['headingrate_lowpass'].value
-      dt = t0 - self.lasttime
-      self.lasttime = t0
-      #if the compass gets a new fix, or the alignment changes,
-      # update the autopilot command so the course remains constant
-      self.compass_change = 0
-      if data:
-        if 'compass_calibration_updated' in data and self.last_heading:
-          # with compass calibration updates, adjust the compass offset to hold the same course
-          # to prevent actual course change
-          last_heading = resolv(self.last_heading, data['heading'])
-          self.compass_change += data['heading'] - headingrate*dt - last_heading
-        self.last_heading = data['heading']
+    def __del__(self):
+        print('closing autopilot')
+        self.server.__del__()
 
-      # if heading offset alignment changed, keep same course
-      if self.last_heading_off != self.boatimu.heading_off.value:
-          self.last_heading_off = resolv(self.last_heading_off, self.boatimu.heading_off.value)
-          self.compass_change += self.boatimu.heading_off.value - self.last_heading_off
-          self.last_heading_off = self.boatimu.heading_off.value
+        if self.watchdog_device:
+            print('close watchdog')
+            self.watchdog_device.write('V')
+            self.watchdog_device.close()
 
-      if self.compass_change:
-          self.gps_compass_offset.value -= self.compass_change
-          self.wind_compass_offset.value += self.compass_change
-          self.true_wind_compass_offset.value += self.compass_change
-          if self.mode.value == 'compass':
-            heading_command = self.heading_command.value + self.compass_change
-            self.heading_command.set(resolv(heading_command, 180))
+    def register(self, _type, name, *args, **kwargs):
+        return self.client.register(_type(*(['ap.' + name] + list(args)), **kwargs))
+
+    def adjust_mode(self, pilot):
+        # if the mode must change
+        newmode = pilot.best_mode(self.preferred_mode.value)
+        if self.mode.value != newmode:
+            self.mode.set_internal(newmode)
+
+    def compute_offsets(self):
+        # compute difference between compass to gps and compass to wind
+        compass = self.boatimu.SensorValues['heading_lowpass'].value
+        if self.sensors.gps.source.value != 'none':
+            d = .002
+            gps_speed = self.sensors.gps.speed.value
+            self.gps_speed = (1-d)*self.gps_speed + d*gps_speed
+            if gps_speed > 1: # don't update gps offset below 1 knot
+                gps_track  = self.sensors.gps.track.value
+                # weight gps compass offset higher with more gps speed
+                d = .005*math.log(self.gps_speed + 1)
+                self.gps_compass_offset.update(gps_track - compass, d)
+
+        if self.sensors.wind.source.value != 'none':
+            d = .005
+            wind_speed = self.sensors.wind.speed.value
+            self.wind_speed = (1-d)*self.wind_speed + d*wind_speed
+            # weight wind direction more with higher wind speed
+            d = .05*math.log(wind_speed/5.0 + 1.2)
+            wind_direction = resolv(self.sensors.wind.direction.value, self.wind_direction.value)
+            wind_direction = (1-d)*self.wind_direction.value + d*wind_direction
+            self.wind_direction.set(resolv(wind_direction))
+            self.wind_compass_offset.update(wind_direction + compass, d)
+
+            if self.sensors.gps.source.value != 'none':
+                true_wind = compute_true_wind(self.gps_speed, self.wind_speed,
+                                              self.wind_direction.value)
+                offset = resolv(true_wind + compass, self.true_wind_compass_offset.value)
+                d = .05
+                self.true_wind_compass_offset.update(offset, d)
+    
+    def fix_compass_calibration_change(self, data, t0):
+        headingrate = self.boatimu.SensorValues['headingrate_lowpass'].value
+        dt = min(t0 - self.lasttime, .25) # maximum dt of .25 seconds
+        self.lasttime = t0
+        #if the compass gets a new fix, or the alignment changes,
+        # update the autopilot command so the course remains constant
+        self.compass_change = 0
+        if data:
+            if 'compass_calibration_updated' in data and self.last_heading:
+                # with compass calibration updates, adjust the compass offset to hold the same course
+                # to prevent actual course change
+                last_heading = resolv(self.last_heading, data['heading'])
+                self.compass_change += data['heading'] - headingrate*dt - last_heading
+            self.last_heading = data['heading']
+
+        # if heading offset alignment changed, keep same course
+        if self.last_heading_off != self.boatimu.heading_off.value:
+            self.last_heading_off = resolv(self.last_heading_off, self.boatimu.heading_off.value)
+            self.compass_change += self.boatimu.heading_off.value - self.last_heading_off
+            self.last_heading_off = self.boatimu.heading_off.value
+            
+        if self.compass_change:
+            self.gps_compass_offset.value -= self.compass_change
+            self.wind_compass_offset.value += self.compass_change
+            self.true_wind_compass_offset.value += self.compass_change
+            if self.mode.value == 'compass':
+                heading_command = self.heading_command.value + self.compass_change
+                self.heading_command.set(resolv(heading_command, 180))
           
-  def compute_heading_error(self, t):
-      heading = self.heading.value
+    def compute_heading_error(self, t):
+        heading = self.heading.value
+        windmode = 'wind' in self.mode.value
 
-      # keep same heading if mode changes
-      if self.mode.value != self.lastmode:
-          error = self.heading_error.value
-          if 'wind' in self.mode.value:
-              error = -error
-          self.heading_command.set(resolv(heading - error, 180))
-          self.lastmode = self.mode.value
+        # keep same heading if mode changes
+        if self.mode.value != self.lastmode:
+            error = self.heading_error.value
+            if windmode:
+                error = -error # wind error is reversed
+            self.heading_command.set(heading - error)
+            self.lastmode = self.mode.value
       
-      # compute heading error
-      heading_command = self.heading_command.value
+        # compute heading error
+        heading_command = self.heading_command.value
+
+        # error +- 60 degrees
+        err = minmax(resolv(heading - heading_command), 60)
       
-      # error +- 60 degrees
-      err = minmax(resolv(heading - heading_command), 60)
-      
-      # since wind direction is where the wind is from, the sign is reversed
-      if 'wind' in self.mode.value:
-          err = -err
-      self.heading_error.set(err)
+        # since wind direction is where the wind is from, the sign is reversed
+        if 'wind' in self.mode.value:
+            err = -err
+        self.heading_error.set(err)
 
-      # compute integral for I gain
-      dt = t - self.heading_error_int_time
-      dt = max(min(dt, 1), 0) # ensure dt is from 0 to 1
-      self.heading_error_int_time = t
-      # int error +- 1, from 0 to 1500 deg/s
-      self.heading_error_int.set(minmax(self.heading_error_int.value + \
-                                        (self.heading_error.value/1500)*dt, 1))
-          
-  def iteration(self):
-      data = False
-      t00 = time.time()
-      # set timestamp
-      for tries in range(14): # try 14 times to read from imu 
-          data = self.boatimu.IMURead()
-          if data:
-              break
-          time.sleep(self.boatimu.period/10)
+        # compute integral for I gain
+        dt = t - self.heading_error_int_time
+        dt = min(dt, 1) # ensure dt is less than 1
+        self.heading_error_int_time = t
+        # int error +- 1, from 0 to 1500 deg/s
+        self.heading_error_int.set(minmax(self.heading_error_int.value + \
+                                          (self.heading_error.value/1500)*dt, 1))          
+    def iteration(self):
+        data = False
+        t0 = time.monotonic()
 
-      if not data:
-          print('autopilot failed to read imu at time:', time.time())
+        self.server.poll() # needed if not multiprocessed
+        msgs = self.client.receive()
+        for msg in msgs: # we aren't usually subscribed to anything
+            print('autopilot main process received:', msg, msgs[msg])
 
-      t0 = time.time()
-      self.fix_compass_calibration_change(data, t0)
-      self.compute_offsets()
+        t1 = time.monotonic()
+        period = 1/self.boatimu.rate.value
+        if t1 - t0 > period/2:
+            print('server/client is running too _slowly_', t1-t0)
 
-      pilot = None
-      for p in self.pilots:
-        if p.name == self.pilot.value or not pilot:
-          pilot = p
+        self.sensors.poll()
 
-      self.adjust_mode(pilot)
-      pilot.compute_heading()
-      self.compute_heading_error(t0)
-          
-      if self.enabled.value:
-          self.runtime.update()
-          self.servo.servo_calibration.stop()
-      else:
-          self.runtime.stop()
+        t2 = time.monotonic()
+        if t2-t1 > period/2:
+            print('sensors is running too _slowly_', t2-t1)
 
-      # reset filters when autopilot is enabled
-      reset = False
-      if self.enabled.value != self.lastenabled:
-        self.lastenabled = self.enabled.value
+        sp = 0
+        for tries in range(14): # try 14 times to read from imu
+            timu = time.monotonic()
+            data = self.boatimu.read()
+            if data:
+                break
+            pd10 = period/10
+            sp += pd10
+            time.sleep(pd10)
+
+        if not data:
+            print('autopilot failed to read imu at time:', time.monotonic(), period)
+
+        t3 = time.monotonic()
+        if t3-t2 > period/2 and data:
+            print('read imu running too _slowly_', t3-t2, period)
+
+        self.fix_compass_calibration_change(data, t0)
+        self.compute_offsets()
+
+        pilot = self.pilots[self.pilot.value] # select pilot
+
+        self.adjust_mode(pilot)
+        pilot.compute_heading()
+        self.compute_heading_error(t0)
+
         if self.enabled.value:
-          self.heading_error_int.set(0) # reset integral
-          reset = True
+            self.runtime.update()
+        else:
+            self.runtime.stop()
+
+        # reset filters when autopilot is enabled
+        reset = False
+        if self.enabled.value != self.lastenabled:
+            self.lastenabled = self.enabled.value
+            if self.enabled.value:
+                self.heading_error_int.set(0) # reset integral
+                reset = True
       
-      # perform tacking or pilot specific calculation
-      if not self.tack.process():
-        pilot.process(reset) # implementation specific process
+        # perform tacking or pilot specific calculation
+        if not self.tack.process():
+            pilot.process(reset) # implementation specific process
 
-      # servo can only disengage under manual control
-      self.servo.force_engaged = self.enabled.value
+        # servo can only disengage under manual control
+        self.servo.force_engaged = self.enabled.value
 
-      t1 = time.time()
-      if t1-t0 > self.boatimu.period/2:
-          print('Autopilot routine is running too _slowly_', t1-t0, self.boatimu.period/2)
+        t4 = time.monotonic()
+        if t4-t3 > period/2:
+            print('Autopilot routine is running too _slowly_', t4-t3)
 
-      self.servo.poll()
-      t2 = time.time()
-      if t2-t1 > self.boatimu.period/2:
-          print('servo is running too _slowly_', t2-t1)
+        self.servo.poll()
+        t5 = time.monotonic()
+        if t5-t4 > period/2 and self.servo.driver:
+            print('servo is running too _slowly_', t5-t4)
 
-      self.sensors.poll()
+        self.timings.set([t1-t0, t2-t1, t3-t2, t4-t3, t5-t4, t5-t0])
+        self.timestamp.set(t0-self.starttime)
+          
+        if self.watchdog_device:
+            self.watchdog_device.write('c')
 
-      t4 = time.time()
-      if t4 - t2 > self.boatimu.period/2:
-          print('sensors is running too _slowly_', t4-t2)
-
-      self.server.HandleRequests()
-      t5 = time.time()
-      if t5 - t4 > self.boatimu.period/2:
-          print('server is running too _slowly_', t5-t4)
-
-      times = t1-t0, t2-t1, t4-t2
-      #self.times = map(lambda x, y : .975*x + .025*y, self.times, times)
-      #print('times', map(lambda t : '%.2f' % (t*1000), self.times))
-      
-      if self.watchdog_device:
-          self.watchdog_device.write('c')
-
-      while True:
-          dt = self.boatimu.period - (time.time() - t00)
-          if dt <= 0 or dt >= self.boatimu.period:
-              break
-          time.sleep(dt)
-
+        while True: # sleep remainder of period
+            dt = period - (time.monotonic() - t0) + sp
+            if dt >= period or dt <= 0:
+                break
+            time.sleep(dt)
 
 def main():
-  ap = Autopilot()
-  ap.run()
+    ap = Autopilot()
+    while True:
+        ap.iteration()
 
 if __name__ == '__main__':
     main()

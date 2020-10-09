@@ -101,8 +101,7 @@ int main(int argc, char *argv[])
             printf("failed to load %s\n", path);
             exit(1);
         }
-    }
-#endif    
+#endif
     double facw = (float)framebuffer->width / logo->width, fach = (float)framebuffer->height / logo->height;
     float facf = facw < fach ? facw : fach;
 
@@ -119,18 +118,22 @@ int main(int argc, char *argv[])
 
     framebuffer->fill(255);
     framebuffer->blit(logom, 0, 0);
-    framebuffer->refresh();
+    static_cast<spiscreen*>(framebuffer)->contrast = 60;
 
+    for(int i=0; i<3; i++) {
+        framebuffer->refresh();
+        usleep(200000);
+    }
 #if 0 // for testing
     while(1) {
         usleep(1000000);
-/*        framebuffer->fill(0);
+        framebuffer->fill(0);
         framebuffer->refresh();
         usleep(1000000);
         framebuffer->fill(255);
         framebuffer->refresh();
         usleep(1000000);
-*/
+
         framebuffer->blit(logom, 0, 0);
         framebuffer->refresh();
     }
